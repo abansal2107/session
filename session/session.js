@@ -71,11 +71,8 @@ defineMethod(Session.prototype, 'resetMaxAge', function resetMaxAge() {
  */
 
 defineMethod(Session.prototype, 'save', function save(fn) {
-  let sess = {};
-
-  for (let index in this) {
-    sess[index] = this[index];
-  }
+  let sess = JSON.stringify(this)
+  sess = JSON.parse(sess)
 
   this.req.sessionStore.set(this.id, Serialize.serialize(sess), fn || function () { });
   return this;
