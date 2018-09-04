@@ -28,6 +28,12 @@ var MemoryStore = require('./session/memory')
 var Session = require('./session/session')
 var Store = require('./session/store')
 
+// requirements
+var PHPUnserialize = require('php-unserialize');
+var Serialize = require('php-serialize');
+var Crypto = require("crypto");
+var randomString = require("randomstring");
+
 // environment
 
 var env = process.env.NODE_ENV;
@@ -64,7 +70,7 @@ var warning = 'Warning: connect.session() MemoryStore is not\n'
 /* istanbul ignore next */
 var defer = typeof setImmediate === 'function'
   ? setImmediate
-  : function(fn){ process.nextTick(fn.bind.apply(fn, arguments)) }
+  : function (fn) { process.nextTick(fn.bind.apply(fn, arguments)) }
 
 /**
  * Setup session store with the given `options`.
@@ -114,6 +120,9 @@ function session(options) {
   // get the cookie signing secret
   var secret = opts.secret
 
+  // get the laravel session setting
+  var laravelSessionSetting = opts.laravelSession;
+
   if (typeof generateId !== 'function') {
     throw new TypeError('genid option must be a function');
   }
@@ -155,7 +164,7 @@ function session(options) {
   }
 
   // generates the new session
-  store.generate = function(req){
+  store.generate = function (req) {
     req.sessionID = generateId(req);
     req.session = new Session(req);
     req.session.cookie = new Cookie(cookieOptions);
@@ -208,16 +217,21 @@ function session(options) {
     var originalHash;
     var originalId;
     var savedHash;
+    var cookieId;
     var touched = false
 
     // expose store
     req.sessionStore = store;
 
     // get the session ID from the cookie
-    var cookieId = req.sessionID = getcookie(req, name, secrets);
+    if (laravelSessionSetting) {
+      cookieId = req.sessionID = getLaravelCookie(req, name, laravelSessionSetting.appKey);
+    } else {
+      cookieId = req.sessionID = getcookie(req, name, secrets);
+    }
 
     // set-cookie
-    onHeaders(res, function(){
+    onHeaders(res, function () {
       if (!req.session) {
         debug('no session');
         return;
@@ -240,7 +254,11 @@ function session(options) {
       }
 
       // set cookie
-      setcookie(res, name, req.sessionID, secrets[0], req.session.cookie.data);
+      if (laravelSessionSetting) {
+        setLaravelCookie(res, name, req.sessionID, laravelSessionSetting.appKey, req.session.cookie.data);
+      } else {
+        setcookie(res, name, req.sessionID, secrets[0], req.session.cookie.data);
+      }
     });
 
     // proxy end() to commit the session
@@ -458,7 +476,7 @@ function session(options) {
 
     // generate the session object
     debug('fetching %s', req.sessionID);
-    store.get(req.sessionID, function(err, sess){
+    store.get(req.sessionID, function (err, sess) {
       // error handling
       if (err) {
         debug('error %j', err);
@@ -469,14 +487,14 @@ function session(options) {
         }
 
         generate();
-      // no session
+        // no session
       } else if (!sess) {
         debug('no session found');
         generate();
-      // populate req.session
+        // populate req.session
       } else {
         debug('session found');
-        store.createSession(req, sess);
+        store.createSession(req, PHPUnserialize.unserialize(sess));
         originalId = req.sessionID;
         originalHash = hash(sess);
 
@@ -500,7 +518,10 @@ function session(options) {
  */
 
 function generateSessionId(sess) {
-  return uid(24);
+  return randomString.generate({
+    length: 40,
+    charset: 'alphanumeric'
+  });
 }
 
 /**
@@ -563,6 +584,65 @@ function getcookie(req, name, secrets) {
       } else {
         debug('cookie unsigned')
       }
+    }
+  }
+
+  return val;
+}
+
+function getLaravelCookie(req, name, key) {
+  var header = req.headers.cookie;
+  var raw;
+  var val;
+
+  // helper function
+  var ord = function (string) {
+    return string.charCodeAt(0);
+  }
+
+  var getSessionIdFromLaravelCookie = function (cookies, name, key) {
+    if (!cookies || !cookies[name]) {
+      return false;
+    }
+
+    var cookie = JSON.parse(new Buffer(cookies[name], 'base64'));
+    var iv = new Buffer(cookie.iv, 'base64');
+    var value = new Buffer(cookie.value, 'base64');
+
+    var decipher = Crypto.createDecipheriv('aes-256-cbc', key, iv);
+    decipher.setAutoPadding(false)
+    var dec = Buffer.concat([decipher.update(value), decipher.final()]);
+
+    var sessionId = PHPUnserialize.unserialize(dec);
+
+    return sessionId;
+  }
+
+  // read from cookie header
+  if (header) {
+    var cookies = cookie.parse(header);
+
+    raw = getSessionIdFromLaravelCookie(cookies, name, key);
+    if (raw) {
+      val = raw;
+    }
+  }
+
+  // back-compat read from cookieParser() signedCookies data
+  if (!val && req.signedCookies) {
+    val = req.signedCookies[name];
+
+    if (val) {
+      deprecate('cookie should be available in req.headers.cookie');
+    }
+  }
+
+  // back-compat read from cookieParser() cookies data
+  if (!val && req.cookies) {
+    raw = getSessionIdFromLaravelCookie(req.cookies, name);
+
+    if (raw) {
+      val = raw;
     }
   }
 
@@ -632,6 +712,36 @@ function issecure(req, trustProxy) {
 function setcookie(res, name, val, secret, options) {
   var signed = 's:' + signature.sign(val, secret);
   var data = cookie.serialize(name, signed, options);
+
+  debug('set-cookie %s', data);
+
+  var prev = res.getHeader('Set-Cookie') || []
+  var header = Array.isArray(prev) ? prev.concat(data) : [prev, data];
+
+  res.setHeader('Set-Cookie', header)
+}
+
+function setLaravelCookie(res, name, val, appKey, options) {
+  var createHmac = Crypto.createHmac('sha256', appKey);
+  var serializedVal = new Buffer(Serialize.serialize(val));
+
+  var iv = Crypto.randomBytes(16);
+  var ivBase64 = new Buffer(iv.toString('base64'));
+
+  var cipher = Crypto.createCipheriv('aes-256-cbc', appKey, iv);
+  var encrypted = Buffer.concat([cipher.update(serializedVal), cipher.final()]);
+  var encryptedBase64 = new Buffer(encrypted.toString('base64'))
+
+  createHmac.update(Buffer.concat([ivBase64, encryptedBase64]));
+  var hmac = createHmac.digest('hex');
+
+  var sessionId = new Buffer(JSON.stringify({
+    iv: ivBase64.toString(),
+    value: encryptedBase64.toString(),
+    mac: hmac
+  }));
+
+  var data = cookie.serialize(name, sessionId.toString('base64'), options);
 
   debug('set-cookie %s', data);
 

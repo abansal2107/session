@@ -6,6 +6,8 @@
  */
 
 'use strict';
+var Serialize = require('php-serialize');
+var Unserialize = require('php-unserialize');
 
 /**
  * Expose Session.
@@ -69,7 +71,13 @@ defineMethod(Session.prototype, 'resetMaxAge', function resetMaxAge() {
  */
 
 defineMethod(Session.prototype, 'save', function save(fn) {
-  this.req.sessionStore.set(this.id, this, fn || function(){});
+  let sess = {};
+
+  for (let index in this) {
+    sess[index] = this[index];
+  }
+
+  this.req.sessionStore.set(this.id, Serialize.serialize(sess), fn || function () { });
   return this;
 });
 
@@ -87,12 +95,11 @@ defineMethod(Session.prototype, 'save', function save(fn) {
 
 defineMethod(Session.prototype, 'reload', function reload(fn) {
   var req = this.req
-  var store = this.req.sessionStore
-
-  store.get(this.id, function(err, sess){
+    , store = this.req.sessionStore;
+  store.get(this.id, function (err, sess) {
     if (err) return fn(err);
     if (!sess) return fn(new Error('failed to load session'));
-    store.createSession(req, sess);
+    store.createSession(req, Unserialize.unserialize(sess));
     fn();
   });
   return this;
